@@ -1,9 +1,10 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactECharts from 'echarts-for-react'
 import { BarChart3, ChevronDown, CircleAlert, Database, Download, FileBarChart, FileText, Filter, FlaskConical, History, Info, LayoutDashboard, LoaderCircle, Menu, Plus, Search, Sparkles, Table2, Trash2, UploadCloud, X } from 'lucide-react'
 import { Analysis, categories, Dataset, histogram, parseText, recommendTarget, ScopeMode, analyze } from './lib/eda'
+import { createStoredAnalysis, deleteStoredAnalysis, listStoredAnalyses, StoredAnalysis, updateStoredAnalysis } from './lib/storage'
 
-type Stage = 'start' | 'confirm' | 'dashboard'
+type Stage = 'start' | 'confirm' | 'dashboard' | 'history'
 type Tab = '개요' | '품질' | '분포' | '관계' | '그룹 비교' | '데이터 미리보기'
 
 const samples = [
@@ -27,10 +28,33 @@ function App() {
   const [groupColumn, setGroupColumn] = useState('')
   const [groupValue, setGroupValue] = useState('')
   const [sidebar, setSidebar] = useState(false)
+  const [historyEntries, setHistoryEntries] = useState<StoredAnalysis[]>([])
+  const [activeRecordId, setActiveRecordId] = useState<string | null>(null)
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
   const inputRef = useRef<HTMLInputElement>(null)
 
   const analysis = useMemo<Analysis | null>(() => dataset && target ? analyze(dataset, target, scope, groupColumn && groupValue ? { column: groupColumn, value: groupValue } : undefined) : null, [dataset, target, scope, groupColumn, groupValue])
   const groupValues = useMemo(() => dataset && groupColumn ? categories(dataset.rows, groupColumn).map(x => x[0]) : [], [dataset, groupColumn])
+
+  const refreshHistory = async () => {
+    try { setHistoryEntries(await listStoredAnalyses()) }
+    catch { setSaveState('error') }
+  }
+
+  useEffect(() => { void refreshHistory() }, [])
+
+  useEffect(() => {
+    if (stage !== 'dashboard' || !activeRecordId) return
+    setSaveState('saving')
+    const timer = window.setTimeout(async () => {
+      try {
+        await updateStoredAnalysis(activeRecordId, { target, scope, groupColumn, groupValue })
+        setSaveState('saved')
+        await refreshHistory()
+      } catch { setSaveState('error') }
+    }, 350)
+    return () => window.clearTimeout(timer)
+  }, [activeRecordId, groupColumn, groupValue, scope, stage, target])
 
   const readFile = async (file: File) => {
     setError('')
@@ -51,10 +75,28 @@ function App() {
 
   const acceptDataset = (ds: Dataset, preferred?: string) => {
     if (ds.rows.length > 20_000 || ds.columns.length > 500 || ds.rows.length * ds.columns.length > 2_000_000) throw new Error('20,000행·500열·2,000,000셀 한도를 확인해 주세요.')
-    setDataset(ds); setTarget(preferred && ds.columns.includes(preferred) ? preferred : recommendTarget(ds)); setGroupColumn(''); setGroupValue(''); setStage('confirm')
+    setDataset(ds); setTarget(preferred && ds.columns.includes(preferred) ? preferred : recommendTarget(ds)); setGroupColumn(''); setGroupValue(''); setActiveRecordId(null); setStage('confirm')
   }
 
-  const reset = () => { setStage('start'); setDataset(null); setTarget(''); setError(''); setTab('개요') }
+  const reset = () => { setStage('start'); setDataset(null); setTarget(''); setError(''); setTab('개요'); setActiveRecordId(null); setSaveState('idle'); setSidebar(false) }
+  const runAnalysis = async () => {
+    if (!dataset) return
+    setStage('dashboard'); setSaveState('saving')
+    try {
+      const record = await createStoredAnalysis({ dataset, target, scope, groupColumn, groupValue })
+      setActiveRecordId(record.id); setSaveState('saved'); await refreshHistory()
+    } catch { setSaveState('error') }
+  }
+  const showHistory = () => { setStage('history'); setSidebar(false); void refreshHistory() }
+  const openHistory = (record: StoredAnalysis) => {
+    setDataset(record.dataset); setTarget(record.target); setScope(record.scope); setGroupColumn(record.groupColumn); setGroupValue(record.groupValue); setActiveRecordId(record.id); setTab('개요'); setSaveState('saved'); setStage('dashboard'); setSidebar(false)
+  }
+  const removeHistory = async (record: StoredAnalysis) => {
+    if (!window.confirm(`'${record.dataset.name}' 분석을 삭제할까요?`)) return
+    await deleteStoredAnalysis(record.id)
+    if (activeRecordId === record.id) reset()
+    await refreshHistory()
+  }
   const download = (format: 'json' | 'csv' | 'md') => {
     if (!analysis) return
     let body = '', type = 'text/plain'
@@ -65,31 +107,45 @@ function App() {
   }
 
   return <div className="app-shell">
-    <Sidebar open={sidebar} close={() => setSidebar(false)} active={stage === 'dashboard' ? 'analysis' : 'new'} reset={reset} />
+    <Sidebar open={sidebar} close={() => setSidebar(false)} active={stage} reset={reset} showHistory={showHistory} showDashboard={() => { if (activeRecordId) setStage('dashboard'); setSidebar(false) }} hasAnalysis={Boolean(activeRecordId)} historyCount={historyEntries.length} />
     <main className="main">
       <header className="topbar">
         <button className="icon-btn mobile-menu" aria-label="메뉴 열기" onClick={() => setSidebar(true)}><Menu size={20} /></button>
-        <div className="crumb"><span>CSV Insight</span><b>/</b><strong>{stage === 'start' ? '새 분석' : dataset?.name}</strong></div>
-        {stage === 'dashboard' && <div className="top-actions"><span className="saved"><span />브라우저에 임시 저장됨</span><div className="dropdown"><button className="secondary"><Download size={16} /> 내보내기 <ChevronDown size={14} /></button><div className="dropdown-menu"><button onClick={() => download('json')}>JSON 결과</button><button onClick={() => download('csv')}>CSV 통계</button><button onClick={() => download('md')}>Markdown 보고서</button></div></div></div>}
+        <div className="crumb"><span>CSV Insight</span><b>/</b><strong>{stage === 'start' ? '새 분석' : stage === 'history' ? '분석 이력' : dataset?.name}</strong></div>
+        {stage === 'dashboard' && <div className="top-actions"><span className={`saved ${saveState}`}><span />{saveState === 'saving' ? '저장 중' : saveState === 'error' ? '임시 저장 실패' : '브라우저에 임시 저장됨'}</span><div className="dropdown"><button className="secondary"><Download size={16} /> 내보내기 <ChevronDown size={14} /></button><div className="dropdown-menu"><button onClick={() => download('json')}>JSON 결과</button><button onClick={() => download('csv')}>CSV 통계</button><button onClick={() => download('md')}>Markdown 보고서</button></div></div></div>}
       </header>
       {stage === 'start' && <StartScreen loading={loading} error={error} drag={drag} setDrag={setDrag} inputRef={inputRef} readFile={readFile} loadSample={loadSample} />}
-      {stage === 'confirm' && dataset && <ConfirmScreen dataset={dataset} target={target} setTarget={setTarget} back={reset} run={() => setStage('dashboard')} />}
+      {stage === 'confirm' && dataset && <ConfirmScreen dataset={dataset} target={target} setTarget={setTarget} back={reset} run={runAnalysis} />}
       {stage === 'dashboard' && analysis && <Dashboard analysis={analysis} tab={tab} setTab={setTab} target={target} setTarget={setTarget} scope={scope} setScope={setScope} groupColumn={groupColumn} setGroupColumn={(v: string) => { setGroupColumn(v); setGroupValue('') }} groupValue={groupValue} setGroupValue={setGroupValue} groupValues={groupValues} />}
+      {stage === 'history' && <HistoryScreen entries={historyEntries} open={openHistory} remove={removeHistory} startNew={reset} />}
     </main>
   </div>
 }
 
-function Sidebar({ open, close, active, reset }: { open: boolean; close: () => void; active: string; reset: () => void }) {
+function Sidebar({ open, close, active, reset, showHistory, showDashboard, hasAnalysis, historyCount }: { open: boolean; close: () => void; active: Stage; reset: () => void; showHistory: () => void; showDashboard: () => void; hasAnalysis: boolean; historyCount: number }) {
   return <><aside className={`sidebar ${open ? 'open' : ''}`}>
     <div className="brand"><div className="brand-mark"><BarChart3 size={21} /></div><div><strong>CSV Insight</strong><span>Auto EDA Workspace</span></div><button className="icon-btn sidebar-close" onClick={close}><X size={18}/></button></div>
     <nav aria-label="주요 메뉴">
-      <button className={active === 'new' ? 'active' : ''} onClick={reset}><Plus size={18}/> 새 분석</button>
-      <button className={active === 'analysis' ? 'active' : ''}><LayoutDashboard size={18}/> 분석 대시보드</button>
-      <button><History size={18}/> 분석 이력 <span className="badge">0</span></button>
+      <button className={active === 'start' || active === 'confirm' ? 'active' : ''} onClick={reset}><Plus size={18}/> 새 분석</button>
+      <button className={active === 'dashboard' ? 'active' : ''} disabled={!hasAnalysis} onClick={showDashboard}><LayoutDashboard size={18}/> 분석 대시보드</button>
+      <button className={active === 'history' ? 'active' : ''} onClick={showHistory}><History size={18}/> 분석 이력 <span className="badge">{historyCount}</span></button>
     </nav>
-    <div className="sidebar-note"><Database size={17}/><div><strong>7일 보관 안내</strong><p>이 버전은 브라우저 세션 동안만 결과를 유지합니다.</p></div></div>
+    <div className="sidebar-note"><Database size={17}/><div><strong>7일 임시 보관</strong><p>이 브라우저에 최근 분석을 최대 5개까지 저장합니다.</p></div></div>
     <div className="side-footer"><div className="avatar">J</div><div><strong>익명 세션</strong><span>개인 워크스페이스</span></div></div>
   </aside>{open && <button className="scrim" aria-label="메뉴 닫기" onClick={close}/>}</>
+}
+
+function HistoryScreen({ entries, open, remove, startNew }: { entries: StoredAnalysis[]; open: (record: StoredAnalysis) => void; remove: (record: StoredAnalysis) => void; startNew: () => void }) {
+  const date = (timestamp: number) => new Intl.DateTimeFormat('ko-KR', { dateStyle: 'medium', timeStyle: 'short' }).format(timestamp)
+  const remaining = (expiresAt: number) => Math.max(1, Math.ceil((expiresAt - Date.now()) / (24 * 60 * 60 * 1000)))
+  return <div className="page-wrap history-page">
+    <div className="history-head"><div><div className="page-kicker">BROWSER STORAGE</div><h1>분석 이력</h1><p className="page-sub">이 브라우저에 임시 저장된 최근 분석입니다. 데이터는 서버로 전송되지 않습니다.</p></div><button className="primary" onClick={startNew}><Plus size={17}/> 새 분석</button></div>
+    {entries.length === 0 ? <section className="panel history-empty"><History size={30}/><h2>저장된 분석이 없습니다</h2><p>분석을 실행하면 데이터와 선택한 설정이 이곳에 7일 동안 저장됩니다.</p><button className="secondary" onClick={startNew}>첫 분석 시작</button></section> : <div className="history-list">{entries.map(record => <article className="panel history-card" key={record.id}>
+      <button className="history-open" onClick={() => open(record)}><div className="history-icon"><FileBarChart size={20}/></div><div><h2>{record.dataset.name}</h2><p>{record.dataset.rows.length.toLocaleString()}행 × {record.dataset.columns.length}열 · 대상 {record.target}</p><span>{date(record.updatedAt)} · {remaining(record.expiresAt)}일 후 자동 삭제</span></div></button>
+      <div className="history-actions"><button className="secondary" onClick={() => open(record)}>다시 열기</button><button className="icon-btn danger" aria-label={`${record.dataset.name} 삭제`} title="삭제" onClick={() => remove(record)}><Trash2 size={17}/></button></div>
+    </article>)}</div>}
+    <div className="privacy history-note"><Info size={16}/><span><strong>보관 정책</strong> 최근 5개 분석만 유지하며, 마지막으로 연 시점부터 7일이 지나면 자동으로 삭제합니다. 브라우저 데이터 삭제 시 함께 사라집니다.</span></div>
+  </div>
 }
 
 function StartScreen({ loading, error, drag, setDrag, inputRef, readFile, loadSample }: any) {
@@ -110,7 +166,7 @@ function StartScreen({ loading, error, drag, setDrag, inputRef, readFile, loadSa
     <div className="sample-grid">{samples.map((s, i) => <button key={s.id} className={`sample-card ${s.color}`} onClick={() => loadSample(s)} disabled={loading}>
       <div className="sample-top"><div className="dataset-icon"><FileBarChart size={21}/></div><span>0{i + 1}</span></div><h3>{s.title}</h3><p>{s.detail}</p><div className="sample-meta"><span>{s.meta}</span><strong>불러오기</strong></div>
     </button>)}</div>
-    <div className="privacy"><Info size={16}/><span><strong>데이터 처리 안내</strong> 업로드 파일은 이 프로토타입에서 브라우저 안에서만 계산됩니다. 운영 버전은 서버 분석·7일 보관 정책을 적용하도록 설계되어 있습니다.</span></div>
+    <div className="privacy"><Info size={16}/><span><strong>데이터 처리 안내</strong> 업로드 파일은 서버로 전송되지 않으며, 분석을 실행하면 이 브라우저의 전용 저장소에 최대 7일간 보관됩니다.</span></div>
   </div>
 }
 
